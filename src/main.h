@@ -22,6 +22,8 @@ DEFINE_GUID (GUID_TrayIcon, 0xAE9053F0, 0x8D59, 0x4803, 0x9A, 0xBB, 0x74, 0xAF, 
 #define TIMER 1000
 #define UID 1337
 
+#define RM_CLEANUPDONE (WM_APP + 12)
+
 #define LANG_SUBMENU 1
 #define LANG_MENU 4
 

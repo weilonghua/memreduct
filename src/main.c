@@ -13,7 +13,39 @@ STATIC_DATA config = {0};
 ULONG limits_arr[13] = {0};
 ULONG intervals_arr[13] = {0};
 
-INT WINAPIV compare_numbers (
+static volatile LONG cleanup_in_progress = 0;
+
+#define _app_config_getboolean(key_name, def_value, section_name) _r_config_getboolean_ex ((key_name), (def_value), (section_name))
+#define _app_config_getfont(key_name, logfont, dpi_value, section_name) _r_config_getfont_ex ((key_name), (logfont), (dpi_value), (section_name))
+#define _app_config_getlong(key_name, def_value, section_name) _r_config_getlong_ex ((key_name), (def_value), (section_name))
+#define _app_config_getlong64(key_name, def_value, section_name) _r_config_getlong64_ex ((key_name), (def_value), (section_name))
+#define _app_config_getulong(key_name, def_value, section_name) _r_config_getulong_ex ((key_name), (def_value), (section_name))
+#define _app_config_setboolean(key_name, value, section_name) _r_config_setboolean_ex ((key_name), (value), (section_name))
+#define _app_config_setfont(key_name, logfont, dpi_value, section_name) _r_config_setfont_ex ((key_name), (logfont), (dpi_value), (section_name))
+#define _app_config_setlong(key_name, value, section_name) _r_config_setlong_ex ((key_name), (value), (section_name))
+#define _app_config_setlong64(key_name, value, section_name) _r_config_setlong64_ex ((key_name), (value), (section_name))
+#define _app_config_setulong(key_name, value, section_name) _r_config_setulong_ex ((key_name), (value), (section_name))
+
+#define _r_config_getboolean _app_config_getboolean
+#define _r_config_getfont _app_config_getfont
+#define _r_config_getlong _app_config_getlong
+#define _r_config_getlong64 _app_config_getlong64
+#define _r_config_getulong _app_config_getulong
+#define _r_config_setboolean _app_config_setboolean
+#define _r_config_setfont _app_config_setfont
+#define _r_config_setlong _app_config_setlong
+#define _r_config_setlong64 _app_config_setlong64
+#define _r_config_setulong _app_config_setulong
+
+typedef struct _CLEANUP_CONTEXT
+{
+	HWND hwnd;
+	CLEANUP_SOURCE_ENUM src;
+	ULONG mask;
+	ULONG flags;
+	ULONG64 reduct_size;
+} CLEANUP_CONTEXT, *PCLEANUP_CONTEXT;
+INT compare_numbers (
 	_In_opt_ PVOID context,
 	_In_ LPCVOID ptr1,
 	_In_ LPCVOID ptr2
@@ -22,8 +54,8 @@ INT WINAPIV compare_numbers (
 	ULONG val1;
 	ULONG val2;
 
-	val1 = PtrToUlong (ptr1);
-	val2 = PtrToUlong (ptr2);
+	val1 = *(PULONG)ptr1;
+	val2 = *(PULONG)ptr2;
 
 	if (val1 < val2)
 		return -1;
@@ -42,7 +74,7 @@ VOID _app_generate_array (
 {
 	PR_HASHTABLE hashtable;
 	ULONG_PTR enum_key = 0;
-	ULONG hash_code;
+	ULONG_PTR hash_code;
 	ULONG index = 0;
 
 	RtlSecureZeroMemory (integers, sizeof (ULONG) * count);
@@ -63,7 +95,7 @@ VOID _app_generate_array (
 	while (_r_obj_enumhashtable (hashtable, NULL, &hash_code, &enum_key))
 	{
 		if (hash_code <= 99)
-			*(PULONG_PTR)PTR_ADD_OFFSET (integers, index * sizeof (ULONG)) = hash_code;
+			integers[index] = (ULONG)hash_code;
 
 		if (++index >= count)
 			break;
@@ -204,105 +236,51 @@ FORCEINLINE LPCWSTR _app_getcleanupreason (
 
 NTSTATUS _app_flushvolumecache ()
 {
-	PMOUNTMGR_MOUNT_POINTS object_mountpoints;
-	PMOUNTMGR_MOUNT_POINT mountpoint;
-	OBJECT_ATTRIBUTES oa = {0};
-	IO_STATUS_BLOCK isb;
-	UNICODE_STRING us;
-	HANDLE hdevice;
 	HANDLE hvolume;
-	NTSTATUS status;
+	WCHAR drive_strings[512];
+	WCHAR volume_path[] = L"\\\\.\\X:";
+	LPWSTR drive;
+	ULONG drive_type;
+	NTSTATUS status = STATUS_SUCCESS;
 
-	RtlInitUnicodeString (&us, MOUNTMGR_DEVICE_NAME);
+	if (!GetLogicalDriveStringsW (RTL_NUMBER_OF (drive_strings), drive_strings))
+		return _r_sys_doserrortontstatus (GetLastError ());
 
-	InitializeObjectAttributes (&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-	status = NtCreateFile (
-		&hdevice,
-		FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-		&oa,
-		&isb,
-		NULL,
-		FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
-		FILE_OPEN,
-		FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-		NULL,
-		0
-	);
-
-	if (!NT_SUCCESS (status))
-		return status;
-
-	status = _r_fs_getvolumemountpoints (hdevice, &object_mountpoints);
-
-	if (!NT_SUCCESS (status))
-		goto CleanupExit;
-
-	for (ULONG i = 0; i < object_mountpoints->NumberOfMountPoints; i++)
+	for (drive = drive_strings; *drive; drive += lstrlenW (drive) + 1)
 	{
-		mountpoint = &object_mountpoints->MountPoints[i];
+		drive_type = GetDriveTypeW (drive);
 
-		us.Length = mountpoint->SymbolicLinkNameLength;
-		us.MaximumLength = mountpoint->SymbolicLinkNameLength + sizeof (UNICODE_NULL);
-		us.Buffer = PTR_ADD_OFFSET (object_mountpoints, mountpoint->SymbolicLinkNameOffset);
+		if (drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_RAMDISK)
+			continue;
 
-		if (MOUNTMGR_IS_VOLUME_NAME (&us)) // \\??\\Volume{1111-2222}
+		volume_path[4] = drive[0];
+
+		hvolume = CreateFileW (volume_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+
+		if (hvolume == INVALID_HANDLE_VALUE)
 		{
-			InitializeObjectAttributes (&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-			status = NtCreateFile (
-				&hvolume,
-				FILE_WRITE_DATA | SYNCHRONIZE,
-				&oa,
-				&isb,
-				NULL,
-				FILE_ATTRIBUTE_NORMAL,
-				FILE_SHARE_READ | FILE_SHARE_WRITE,
-				FILE_OPEN,
-				FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
-				NULL,
-				0
-			);
-
-			if (NT_SUCCESS (status))
-			{
-				status = _r_fs_flushfile (hvolume);
-
-				NtClose (hvolume);
-			}
+			status = _r_sys_doserrortontstatus (GetLastError ());
+			continue;
 		}
+
+		status = _r_fs_flushfile (hvolume);
+
+		CloseHandle (hvolume);
 	}
-
-	_r_mem_free (object_mountpoints);
-
-CleanupExit:
-
-	NtClose (hdevice);
 
 	return status;
 }
-
-VOID _app_memoryclean (
-	_In_opt_ HWND hwnd,
-	_In_ CLEANUP_SOURCE_ENUM src,
-	_In_opt_ ULONG mask
+BOOLEAN _app_memorycleanprepare (
+	_Inout_ PCLEANUP_CONTEXT cleanup_context
 )
 {
-	MEMORY_COMBINE_INFORMATION_EX combine_info_ex = {0};
-	SYSTEM_FILECACHE_INFORMATION sfci = {0};
-	SYSTEM_MEMORY_LIST_COMMAND command;
-	R_MEMORY_INFO mem_info;
-	WCHAR buffer1[256] = {0};
-	WCHAR buffer2[256] = {0};
+	WCHAR buffer[256] = {0};
 	LPCWSTR error_text;
-	ULONG64 reduct_before;
-	ULONG64 reduct_after;
-	ULONG flags = NIIF_WARNING;
-	NTSTATUS status;
+
+	cleanup_context->flags = NIIF_WARNING;
 
 	if (!_r_config_getboolean (L"IsNotificationsSound", TRUE, NULL))
-		flags |= NIIF_NOSOUND;
+		cleanup_context->flags |= NIIF_NOSOUND;
 
 	if (!_r_sys_iselevated ())
 	{
@@ -310,67 +288,80 @@ VOID _app_memoryclean (
 
 		if (_r_app_runasadmin ())
 		{
-			if (hwnd)
-				DestroyWindow (hwnd);
+			if (cleanup_context->hwnd)
+				DestroyWindow (cleanup_context->hwnd);
 		}
 		else
 		{
-			if (src == SOURCE_CMDLINE)
+			if (cleanup_context->src == SOURCE_CMDLINE)
 			{
-				if (hwnd)
-					_r_show_message (hwnd, MB_OK | MB_ICONSTOP, NULL, error_text);
+				if (cleanup_context->hwnd)
+					_r_show_message (cleanup_context->hwnd, MB_OK | MB_ICONSTOP, NULL, error_text);
 			}
 			else
 			{
-				if (hwnd)
-					_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), error_text);
+				if (cleanup_context->hwnd)
+					_r_tray_popup (cleanup_context->hwnd, &GUID_TrayIcon, cleanup_context->flags, _r_app_getname (), error_text);
 			}
 		}
 
-		return;
+		return FALSE;
 	}
 
-	if (!mask)
-		mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
+	if (!cleanup_context->mask)
+		cleanup_context->mask = _r_config_getulong (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
 
-	if (src == SOURCE_AUTO)
+	if (cleanup_context->src == SOURCE_AUTO)
 	{
 		if (!_r_config_getboolean (L"IsAllowStandbyListCleanup", FALSE, NULL))
-			mask &= ~REDUCT_MASK_FREEZES; // exclude freezes from autoclean feature ;)
+			cleanup_context->mask &= ~REDUCT_MASK_FREEZES; // exclude freezes from autoclean feature ;)
 	}
-	else if (src == SOURCE_MANUAL)
+	else if (cleanup_context->src == SOURCE_MANUAL)
 	{
-		if ((mask & REDUCT_WORKING_SET) == REDUCT_WORKING_SET)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_WORKINGSET L"\r\n");
+		if ((cleanup_context->mask & REDUCT_WORKING_SET) == REDUCT_WORKING_SET)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_WORKINGSET L"\r\n");
 
-		if ((mask & REDUCT_SYSTEM_FILE_CACHE) == REDUCT_SYSTEM_FILE_CACHE)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_SYSTEMFILECACHE L"\r\n");
+		if ((cleanup_context->mask & REDUCT_SYSTEM_FILE_CACHE) == REDUCT_SYSTEM_FILE_CACHE)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_SYSTEMFILECACHE L"\r\n");
 
-		if ((mask & REDUCT_MODIFIED_FILE_CACHE) == REDUCT_MODIFIED_FILE_CACHE)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_MODIFIEDFILECACHE L"\r\n");
+		if ((cleanup_context->mask & REDUCT_MODIFIED_FILE_CACHE) == REDUCT_MODIFIED_FILE_CACHE)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_MODIFIEDFILECACHE L"\r\n");
 
-		if ((mask & REDUCT_MODIFIED_LIST) == REDUCT_MODIFIED_LIST)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_MODIFIEDLIST L"\r\n");
+		if ((cleanup_context->mask & REDUCT_MODIFIED_LIST) == REDUCT_MODIFIED_LIST)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_MODIFIEDLIST L"\r\n");
 
-		if ((mask & REDUCT_STANDBY_LIST) == REDUCT_STANDBY_LIST)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_STANDBYLIST L"\r\n");
+		if ((cleanup_context->mask & REDUCT_STANDBY_LIST) == REDUCT_STANDBY_LIST)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_STANDBYLIST L"\r\n");
 
-		if ((mask & REDUCT_STANDBY_PRIORITY0_LIST) == REDUCT_STANDBY_PRIORITY0_LIST)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_STANDBYLISTPRIORITY0 L"\r\n");
+		if ((cleanup_context->mask & REDUCT_STANDBY_PRIORITY0_LIST) == REDUCT_STANDBY_PRIORITY0_LIST)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_STANDBYLISTPRIORITY0 L"\r\n");
 
-		if ((mask & REDUCT_REGISTRY_CACHE) == REDUCT_REGISTRY_CACHE)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_REGISTRYCACHE L"\r\n");
+		if ((cleanup_context->mask & REDUCT_REGISTRY_CACHE) == REDUCT_REGISTRY_CACHE)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_REGISTRYCACHE L"\r\n");
 
-		if ((mask & REDUCT_COMBINE_MEMORY_LISTS) == REDUCT_COMBINE_MEMORY_LISTS)
-			_r_str_append (buffer1, RTL_NUMBER_OF (buffer1), L"- " TITLE_COMBINEMEMORYLISTS L"\r\n");
+		if ((cleanup_context->mask & REDUCT_COMBINE_MEMORY_LISTS) == REDUCT_COMBINE_MEMORY_LISTS)
+			_r_str_append (buffer, RTL_NUMBER_OF (buffer), L"- " TITLE_COMBINEMEMORYLISTS L"\r\n");
 
-		StrTrimW (buffer1, L"\r\n");
+		StrTrimW (buffer, L"\r\n");
 
-		if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION), buffer1, L"IsShowReductConfirmation", FALSE))
-			return;
+		if (!_r_show_confirmmessage (cleanup_context->hwnd, _r_locale_getstring (IDS_QUESTION), buffer, L"IsShowReductConfirmation", FALSE))
+			return FALSE;
 	}
 
-	SetCursor (LoadCursorW (NULL, IDC_WAIT));
+	return TRUE;
+}
+
+ULONG64 _app_memorycleanrun (
+	_In_ ULONG mask
+)
+{
+	MEMORY_COMBINE_INFORMATION_EX combine_info_ex = {0};
+	SYSTEM_FILECACHE_INFORMATION sfci = {0};
+	SYSTEM_MEMORY_LIST_COMMAND command;
+	R_MEMORY_INFO mem_info;
+	ULONG64 reduct_before;
+	ULONG64 reduct_after;
+	NTSTATUS status;
 
 	// difference (before)
 	reduct_before = _app_getmemoryinfo (&mem_info);
@@ -459,8 +450,6 @@ VOID _app_memoryclean (
 		}
 	}
 
-	SetCursor (LoadCursorW (NULL, IDC_ARROW));
-
 	// difference (after)
 	reduct_after = _app_getmemoryinfo (&mem_info);
 
@@ -476,30 +465,159 @@ VOID _app_memoryclean (
 	// time of last cleaning
 	_r_config_setlong64 (L"StatisticLastReduct", _r_unixtime_now (), NULL);
 
-	_r_format_bytesize64 (buffer1, RTL_NUMBER_OF (buffer1), reduct_after);
+	return reduct_after;
+}
+
+VOID _app_memorycleancomplete (
+	_In_ PCLEANUP_CONTEXT cleanup_context
+)
+{
+	WCHAR buffer1[256] = {0};
+	WCHAR buffer2[256] = {0};
+
+	_r_format_bytesize64 (buffer1, RTL_NUMBER_OF (buffer1), cleanup_context->reduct_size);
 
 	_r_str_printf (buffer2, RTL_NUMBER_OF (buffer2), _r_locale_getstring (IDS_STATUS_CLEANED), buffer1);
 
-	if (src == SOURCE_CMDLINE)
+	if (cleanup_context->src == SOURCE_CMDLINE)
 	{
 		if (_r_config_getboolean (L"BalloonCleanResults", TRUE, NULL))
 		{
-			if (!_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer2))
-				_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, NULL, buffer2);
+			if (cleanup_context->hwnd)
+			{
+				_r_tray_popup (cleanup_context->hwnd, &GUID_TrayIcon, cleanup_context->flags, _r_app_getname (), buffer2);
+			}
+			else
+			{
+				_r_show_message (cleanup_context->hwnd, MB_OK | MB_ICONINFORMATION, NULL, buffer2);
+			}
 		}
 		else
 		{
-			_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, NULL, buffer2);
+			_r_show_message (cleanup_context->hwnd, MB_OK | MB_ICONINFORMATION, NULL, buffer2);
 		}
 	}
 	else
 	{
-		if (hwnd && _r_config_getboolean (L"BalloonCleanResults", TRUE, NULL))
-			_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer2);
+		if (cleanup_context->hwnd && _r_config_getboolean (L"BalloonCleanResults", TRUE, NULL))
+			_r_tray_popup (cleanup_context->hwnd, &GUID_TrayIcon, cleanup_context->flags, _r_app_getname (), buffer2);
 	}
 
 	if (_r_config_getboolean (L"LogCleanResults", FALSE, NULL))
-		_r_log_v (LOG_LEVEL_INFO, 0, _app_getcleanupreason (src), 0, buffer1);
+		_r_log_v (LOG_LEVEL_INFO, 0, _app_getcleanupreason (cleanup_context->src), 0, buffer1);
+}
+
+VOID _app_memoryclean (
+	_In_opt_ HWND hwnd,
+	_In_ CLEANUP_SOURCE_ENUM src,
+	_In_opt_ ULONG mask
+)
+{
+	CLEANUP_CONTEXT cleanup_context = {0};
+
+	cleanup_context.hwnd = hwnd;
+	cleanup_context.src = src;
+	cleanup_context.mask = mask;
+
+	if (!_app_memorycleanprepare (&cleanup_context))
+		return;
+
+	SetCursor (LoadCursorW (NULL, IDC_WAIT));
+
+	cleanup_context.reduct_size = _app_memorycleanrun (cleanup_context.mask);
+
+	SetCursor (LoadCursorW (NULL, IDC_ARROW));
+
+	_app_memorycleancomplete (&cleanup_context);
+}
+
+DWORD CALLBACK _app_memorycleanthread (
+	_In_ PVOID context
+)
+{
+	PCLEANUP_CONTEXT cleanup_context;
+
+	cleanup_context = context;
+
+	cleanup_context->reduct_size = _app_memorycleanrun (cleanup_context->mask);
+
+	if (cleanup_context->hwnd && IsWindow (cleanup_context->hwnd) && PostMessageW (cleanup_context->hwnd, RM_CLEANUPDONE, 0, (LPARAM)cleanup_context))
+	{
+		cleanup_context = NULL;
+	}
+	else
+	{
+		_app_memorycleancomplete (cleanup_context);
+	}
+
+	if (cleanup_context)
+		_r_mem_free (cleanup_context);
+
+	InterlockedExchange (&cleanup_in_progress, 0);
+
+	return 0;
+}
+
+VOID _app_memorycleanstart (
+	_In_opt_ HWND hwnd,
+	_In_ CLEANUP_SOURCE_ENUM src,
+	_In_opt_ ULONG mask
+)
+{
+	PCLEANUP_CONTEXT cleanup_context;
+	HANDLE hthread;
+
+	if (InterlockedCompareExchange (&cleanup_in_progress, 1, 0) != 0)
+		return;
+
+	cleanup_context = _r_mem_allocate (sizeof (CLEANUP_CONTEXT));
+
+	if (!cleanup_context)
+	{
+		InterlockedExchange (&cleanup_in_progress, 0);
+		return;
+	}
+
+	cleanup_context->hwnd = hwnd;
+	cleanup_context->src = src;
+	cleanup_context->mask = mask;
+
+	if (!_app_memorycleanprepare (cleanup_context))
+	{
+		_r_mem_free (cleanup_context);
+
+		InterlockedExchange (&cleanup_in_progress, 0);
+
+		return;
+	}
+
+	SetCursor (LoadCursorW (NULL, IDC_WAIT));
+
+	hthread = CreateThread (NULL, 0, &_app_memorycleanthread, cleanup_context, 0, NULL);
+
+	if (!hthread)
+	{
+		cleanup_context->reduct_size = _app_memorycleanrun (cleanup_context->mask);
+
+		SetCursor (LoadCursorW (NULL, IDC_ARROW));
+
+		_app_memorycleancomplete (cleanup_context);
+
+		_r_mem_free (cleanup_context);
+
+		InterlockedExchange (&cleanup_in_progress, 0);
+
+		return;
+	}
+
+	CloseHandle (hthread);
+}
+
+VOID _app_autocleanstart (
+	_In_opt_ HWND hwnd
+)
+{
+	_app_memorycleanstart (hwnd, SOURCE_AUTO, 0);
 }
 
 VOID _app_fontinit (
@@ -660,7 +778,7 @@ HICON _app_iconcreate (
 
 	_r_dc_drawtext (NULL, config.hdc_mask, &sr, &config.icon_size, 0, 0, DT_VCENTER | DT_CENTER | DT_SINGLELINE | DT_NOCLIP | DT_NOPREFIX, TRAY_COLOR_BLACK);
 
-	SetBkMode (config.hdc, prev_mode);
+	SetBkMode (config.hdc_mask, prev_mode);
 
 	SelectObject (config.hdc_mask, prev_bmp);
 	SelectObject (config.hdc_mask, prev_font);
@@ -671,6 +789,9 @@ HICON _app_iconcreate (
 	ii.hbmMask = config.hbitmap_mask;
 
 	hicon_new = CreateIconIndirect (&ii);
+
+	if (!hicon_new)
+		return hicon;
 
 	if (hicon)
 		DestroyIcon (hicon);
@@ -717,7 +838,7 @@ VOID CALLBACK _app_timercallback (
 		}
 
 		if (is_clean)
-			_app_memoryclean (hwnd, SOURCE_AUTO, 0);
+			_app_autocleanstart (hwnd);
 	}
 
 	// check previous percent to prevent icon redraw
@@ -2060,7 +2181,7 @@ INT_PTR CALLBACK DlgProc (
 		case WM_HOTKEY:
 		{
 			if (wparam == UID)
-				_app_memoryclean (hwnd, SOURCE_HOTKEY, 0);
+				_app_memorycleanstart (hwnd, SOURCE_HOTKEY, 0);
 
 			break;
 		}
@@ -2112,7 +2233,7 @@ INT_PTR CALLBACK DlgProc (
 						ClientToScreen (nmlp->hwndFrom, (PPOINT)&rect);
 
 						_r_wnd_recttorectangle (&rectangle, &rect);
-						_r_wnd_adjustrectangletoworkingarea (nmlp->hwndFrom, &rectangle);
+						_r_wnd_adjustrectangletoworkingarea (&rectangle, nmlp->hwndFrom);
 						_r_wnd_rectangletorect (&rect, &rectangle);
 
 						_r_menu_popup (hsubmenu, hwnd, (PPOINT)&rect, TRUE);
@@ -2173,6 +2294,26 @@ INT_PTR CALLBACK DlgProc (
 			break;
 		}
 
+		case RM_CLEANUPDONE:
+		{
+			PCLEANUP_CONTEXT cleanup_context;
+
+			cleanup_context = (PCLEANUP_CONTEXT)lparam;
+
+			if (cleanup_context)
+			{
+				SetCursor (LoadCursorW (NULL, IDC_ARROW));
+
+				_app_memorycleancomplete (cleanup_context);
+
+				_r_mem_free (cleanup_context);
+			}
+
+			_app_iconredraw (hwnd);
+
+			break;
+		}
+
 		case RM_TRAYICON:
 		{
 			switch (LOWORD (lparam))
@@ -2203,7 +2344,7 @@ INT_PTR CALLBACK DlgProc (
 					{
 						case 1:
 						{
-							_app_memoryclean (hwnd, SOURCE_MANUAL, 0);
+							_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0);
 							break;
 						}
 
@@ -2632,7 +2773,7 @@ INT_PTR CALLBACK DlgProc (
 						}
 					}
 
-					_app_memoryclean (hwnd, SOURCE_CMDLINE, mask);
+					_app_memorycleanstart (hwnd, SOURCE_CMDLINE, mask);
 
 					break;
 				}
@@ -2686,7 +2827,7 @@ INT_PTR CALLBACK DlgProc (
 				{
 					if (_r_sys_iselevated ())
 					{
-						_app_memoryclean (hwnd, SOURCE_MANUAL, 0);
+						_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0);
 					}
 					else
 					{
