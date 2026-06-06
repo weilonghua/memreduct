@@ -9,6 +9,8 @@
 #include "resource.h"
 
 STATIC_DATA config = {0};
+static HICON icon_cache[ICON_CACHE_SIZE] = {0};
+static LONG64 percent_backoff_until = 0;
 
 ULONG limits_arr[13] = {0};
 ULONG intervals_arr[13] = {0};
@@ -41,6 +43,7 @@ typedef struct _CLEANUP_CONTEXT
 {
 	HWND hwnd;
 	CLEANUP_SOURCE_ENUM src;
+	ULONG reason;
 	ULONG mask;
 	ULONG flags;
 	ULONG64 reduct_size;
@@ -201,6 +204,45 @@ ULONG64 _app_getmemoryinfo (
 	return mem_info->physical_memory.used_bytes;
 }
 
+FORCEINLINE ULONG64 _app_uint64diff (
+	_In_ ULONG64 value1,
+	_In_ ULONG64 value2
+)
+{
+	return value1 > value2 ? value1 - value2 : value2 - value1;
+}
+
+FORCEINLINE BOOLEAN _app_ismemoryupdatesignificant (
+	_In_ PR_MEMORY_INFO current,
+	_In_ PR_MEMORY_INFO previous
+)
+{
+	const ULONG64 byte_delta = 64ULL * 1024ULL * 1024ULL;
+
+	if (current->physical_memory.percent != previous->physical_memory.percent)
+		return TRUE;
+
+	if (current->page_file.percent != previous->page_file.percent)
+		return TRUE;
+
+	if (current->system_cache.percent != previous->system_cache.percent)
+		return TRUE;
+
+	if (current->physical_memory.total_bytes != previous->physical_memory.total_bytes || current->page_file.total_bytes != previous->page_file.total_bytes || current->system_cache.total_bytes != previous->system_cache.total_bytes)
+		return TRUE;
+
+	if (_app_uint64diff (current->physical_memory.free_bytes, previous->physical_memory.free_bytes) >= byte_delta)
+		return TRUE;
+
+	if (_app_uint64diff (current->page_file.free_bytes, previous->page_file.free_bytes) >= byte_delta)
+		return TRUE;
+
+	if (_app_uint64diff (current->system_cache.free_bytes, previous->system_cache.free_bytes) >= byte_delta)
+		return TRUE;
+
+	return FALSE;
+}
+
 FORCEINLINE LPCWSTR _app_getcleanupreason (
 	_In_ CLEANUP_SOURCE_ENUM src
 )
@@ -241,7 +283,9 @@ NTSTATUS _app_flushvolumecache ()
 	WCHAR volume_path[] = L"\\\\.\\X:";
 	LPWSTR drive;
 	ULONG drive_type;
+	ULONG failed_count = 0;
 	NTSTATUS status = STATUS_SUCCESS;
+	NTSTATUS first_error = STATUS_SUCCESS;
 
 	if (!GetLogicalDriveStringsW (RTL_NUMBER_OF (drive_strings), drive_strings))
 		return _r_sys_doserrortontstatus (GetLastError ());
@@ -260,15 +304,36 @@ NTSTATUS _app_flushvolumecache ()
 		if (hvolume == INVALID_HANDLE_VALUE)
 		{
 			status = _r_sys_doserrortontstatus (GetLastError ());
+
+			if (first_error == STATUS_SUCCESS)
+				first_error = status;
+
+			failed_count += 1;
+
+			_r_log (LOG_LEVEL_WARNING, NULL, L"CreateFile", status, drive);
+
 			continue;
 		}
 
 		status = _r_fs_flushfile (hvolume);
 
+		if (!NT_SUCCESS (status))
+		{
+			if (first_error == STATUS_SUCCESS)
+				first_error = status;
+
+			failed_count += 1;
+
+			_r_log (LOG_LEVEL_WARNING, NULL, L"FlushFileBuffers", status, drive);
+		}
+
 		CloseHandle (hvolume);
 	}
 
-	return status;
+	if (failed_count)
+		return first_error;
+
+	return STATUS_SUCCESS;
 }
 BOOLEAN _app_memorycleanprepare (
 	_Inout_ PCLEANUP_CONTEXT cleanup_context
@@ -391,7 +456,12 @@ ULONG64 _app_memorycleanrun (
 
 	// Flush volume cache
 	if ((mask & REDUCT_MODIFIED_FILE_CACHE) == REDUCT_MODIFIED_FILE_CACHE)
-		_app_flushvolumecache ();
+	{
+		status = _app_flushvolumecache ();
+
+		if (!NT_SUCCESS (status))
+			_r_log (LOG_LEVEL_WARNING, NULL, L"FlushVolumeCache", status, NULL);
+	}
 
 	// Modified page list (vista+)
 	if ((mask & REDUCT_MODIFIED_LIST) == REDUCT_MODIFIED_LIST)
@@ -507,9 +577,30 @@ VOID _app_memorycleancomplete (
 		_r_log_v (LOG_LEVEL_INFO, 0, _app_getcleanupreason (cleanup_context->src), 0, buffer1);
 }
 
+VOID _app_memorycleanautotune (
+	_In_ PCLEANUP_CONTEXT cleanup_context,
+	_Inout_ PLONG64 percent_backoff_until
+)
+{
+	if (cleanup_context->src != SOURCE_AUTO)
+		return;
+
+	if ((cleanup_context->reason & CLEANUP_REASON_PERCENT) != CLEANUP_REASON_PERCENT)
+		return;
+
+	if (cleanup_context->reduct_size >= DEFAULT_AUTOREDUCT_LOW_EFFECT_BYTES)
+	{
+		*percent_backoff_until = 0;
+		return;
+	}
+
+	*percent_backoff_until = _r_unixtime_now () + DEFAULT_AUTOREDUCT_LOW_EFFECT_BACKOFF_SEC;
+}
+
 VOID _app_memoryclean (
 	_In_opt_ HWND hwnd,
 	_In_ CLEANUP_SOURCE_ENUM src,
+	_In_opt_ ULONG reason,
 	_In_opt_ ULONG mask
 )
 {
@@ -517,6 +608,7 @@ VOID _app_memoryclean (
 
 	cleanup_context.hwnd = hwnd;
 	cleanup_context.src = src;
+	cleanup_context.reason = reason;
 	cleanup_context.mask = mask;
 
 	if (!_app_memorycleanprepare (&cleanup_context))
@@ -527,6 +619,8 @@ VOID _app_memoryclean (
 	cleanup_context.reduct_size = _app_memorycleanrun (cleanup_context.mask);
 
 	SetCursor (LoadCursorW (NULL, IDC_ARROW));
+
+	_app_memorycleanautotune (&cleanup_context, &percent_backoff_until);
 
 	_app_memorycleancomplete (&cleanup_context);
 }
@@ -547,6 +641,7 @@ DWORD CALLBACK _app_memorycleanthread (
 	}
 	else
 	{
+		_app_memorycleanautotune (cleanup_context, &percent_backoff_until);
 		_app_memorycleancomplete (cleanup_context);
 	}
 
@@ -561,6 +656,7 @@ DWORD CALLBACK _app_memorycleanthread (
 VOID _app_memorycleanstart (
 	_In_opt_ HWND hwnd,
 	_In_ CLEANUP_SOURCE_ENUM src,
+	_In_opt_ ULONG reason,
 	_In_opt_ ULONG mask
 )
 {
@@ -580,6 +676,7 @@ VOID _app_memorycleanstart (
 
 	cleanup_context->hwnd = hwnd;
 	cleanup_context->src = src;
+	cleanup_context->reason = reason;
 	cleanup_context->mask = mask;
 
 	if (!_app_memorycleanprepare (cleanup_context))
@@ -614,10 +711,11 @@ VOID _app_memorycleanstart (
 }
 
 VOID _app_autocleanstart (
-	_In_opt_ HWND hwnd
+	_In_opt_ HWND hwnd,
+	_In_opt_ ULONG reason
 )
 {
-	_app_memorycleanstart (hwnd, SOURCE_AUTO, 0);
+	_app_memorycleanstart (hwnd, SOURCE_AUTO, reason, 0);
 }
 
 VOID _app_fontinit (
@@ -676,19 +774,27 @@ VOID _app_drawbackground (
 	SetBkColor (hdc, prev_clr);
 }
 
-HICON _app_iconcreate (
-	_In_opt_ ULONG percent
+VOID _app_iconcacheclear ()
+{
+	for (ULONG i = 0; i < RTL_NUMBER_OF (icon_cache); i++)
+	{
+		if (icon_cache[i])
+		{
+			DestroyIcon (icon_cache[i]);
+			icon_cache[i] = NULL;
+		}
+	}
+}
+
+HICON _app_iconrender (
+	_In_ ULONG percent
 )
 {
-	static HICON hicon = NULL;
-
-	R_MEMORY_INFO mem_info;
 	R_STRINGREF sr;
 	ICONINFO ii = {0};
 	WCHAR icon_text[8];
 	HGDIOBJ prev_font;
 	HGDIOBJ prev_bmp;
-	HICON hicon_new;
 	COLORREF text_color;
 	COLORREF bg_color;
 	LONG prev_mode;
@@ -704,13 +810,6 @@ HICON _app_iconcreate (
 	is_transparent = _r_config_getboolean (L"TrayUseTransparency", FALSE, NULL);
 	is_border = _r_config_getboolean (L"TrayShowBorder", FALSE, NULL);
 	is_round = _r_config_getboolean (L"TrayRoundCorners", FALSE, NULL);
-
-	if (!percent)
-	{
-		_app_getmemoryinfo (&mem_info);
-
-		percent = mem_info.physical_memory.percent;
-	}
 
 	has_danger = percent >= _app_getdangervalue ();
 	has_warning = !has_danger && percent >= _app_getwarningvalue ();
@@ -788,17 +887,29 @@ HICON _app_iconcreate (
 	ii.hbmColor = config.hbitmap;
 	ii.hbmMask = config.hbitmap_mask;
 
-	hicon_new = CreateIconIndirect (&ii);
+	return CreateIconIndirect (&ii);
+}
 
-	if (!hicon_new)
-		return hicon;
+HICON _app_iconcreate (
+	_In_opt_ ULONG percent
+)
+{
+	R_MEMORY_INFO mem_info;
 
-	if (hicon)
-		DestroyIcon (hicon);
+	if (!percent)
+	{
+		_app_getmemoryinfo (&mem_info);
 
-	hicon = hicon_new;
+		percent = mem_info.physical_memory.percent;
+	}
 
-	return hicon;
+	if (percent >= ICON_CACHE_SIZE)
+		percent = ICON_CACHE_SIZE - 1;
+
+	if (!icon_cache[percent])
+		icon_cache[percent] = _app_iconrender (percent);
+
+	return icon_cache[percent];
 }
 
 VOID CALLBACK _app_timercallback (
@@ -809,11 +920,21 @@ VOID CALLBACK _app_timercallback (
 )
 {
 	R_MEMORY_INFO mem_info;
+	static R_MEMORY_INFO last_visible_mem_info = {0};
+	static ULONG last_tray_physical_percent = ULONG_MAX;
+	static ULONG last_tray_page_file_percent = ULONG_MAX;
+	static ULONG last_tray_system_cache_percent = ULONG_MAX;
+	static BOOLEAN has_last_visible_mem_info = FALSE;
+	static BOOLEAN was_visible = FALSE;
 	WCHAR buffer[128];
+	HWND hlistview;
 	HICON hicon = NULL;
 	LONG64 timestamp;
+	LONG64 current_time;
 	ULONG percent;
+	ULONG cleanup_reason = 0;
 	BOOLEAN is_clean = FALSE;
+	BOOLEAN is_visible;
 
 	if (id_event != UID)
 		return;
@@ -823,22 +944,29 @@ VOID CALLBACK _app_timercallback (
 	// autocleanup functional
 	if (_r_sys_iselevated ())
 	{
+		current_time = _r_unixtime_now ();
+		timestamp = current_time - _r_config_getlong64 (L"StatisticLastReduct", 0, NULL);
+
 		if (_r_config_getboolean (L"AutoreductEnable", FALSE, NULL))
 		{
-			if (mem_info.physical_memory.percent >= _app_getlimitvalue ())
+			if (mem_info.physical_memory.percent >= _app_getlimitvalue () && timestamp >= DEFAULT_AUTOREDUCT_COOLDOWN_SEC && (current_time >= percent_backoff_until || mem_info.physical_memory.percent >= _app_getdangervalue ()))
+			{
 				is_clean = TRUE;
+				cleanup_reason |= CLEANUP_REASON_PERCENT;
+			}
 		}
 
 		if (!is_clean && _r_config_getboolean (L"AutoreductIntervalEnable", FALSE, NULL))
 		{
-			timestamp = _r_unixtime_now () - _r_config_getlong64 (L"StatisticLastReduct", 0, NULL);
-
 			if (timestamp >= (_app_getintervalvalue () * 60))
+			{
 				is_clean = TRUE;
+				cleanup_reason |= CLEANUP_REASON_INTERVAL;
+			}
 		}
 
 		if (is_clean)
-			_app_autocleanstart (hwnd);
+			_app_autocleanstart (hwnd, cleanup_reason);
 	}
 
 	// check previous percent to prevent icon redraw
@@ -849,21 +977,45 @@ VOID CALLBACK _app_timercallback (
 		hicon = _app_iconcreate (config.ms_prev);
 	}
 
-	_r_tray_setinfoformat (
-		hwnd,
-		&GUID_TrayIcon,
-		hicon,
-		L"%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%",
-		_r_locale_getstring (IDS_GROUP_1),
-		mem_info.physical_memory.percent_f,
-		_r_locale_getstring (IDS_GROUP_2),
-		mem_info.page_file.percent_f,
-		_r_locale_getstring (IDS_GROUP_3),
-		mem_info.system_cache.percent_f
-	);
+	if (hicon || last_tray_physical_percent != mem_info.physical_memory.percent || last_tray_page_file_percent != mem_info.page_file.percent || last_tray_system_cache_percent != mem_info.system_cache.percent)
+	{
+		last_tray_physical_percent = mem_info.physical_memory.percent;
+		last_tray_page_file_percent = mem_info.page_file.percent;
+		last_tray_system_cache_percent = mem_info.system_cache.percent;
 
-	if (!_r_wnd_isvisible (hwnd, FALSE))
+		_r_tray_setinfoformat (
+			hwnd,
+			&GUID_TrayIcon,
+			hicon,
+			L"%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%",
+			_r_locale_getstring (IDS_GROUP_1),
+			mem_info.physical_memory.percent_f,
+			_r_locale_getstring (IDS_GROUP_2),
+			mem_info.page_file.percent_f,
+			_r_locale_getstring (IDS_GROUP_3),
+			mem_info.system_cache.percent_f
+		);
+	}
+
+	is_visible = _r_wnd_isvisible (hwnd, FALSE);
+
+	if (!is_visible)
+	{
+		was_visible = FALSE;
 		return;
+	}
+
+	if (was_visible && has_last_visible_mem_info && !_app_ismemoryupdatesignificant (&mem_info, &last_visible_mem_info))
+		return;
+
+	last_visible_mem_info = mem_info;
+	has_last_visible_mem_info = TRUE;
+	was_visible = TRUE;
+
+	hlistview = GetDlgItem (hwnd, IDC_LISTVIEW);
+
+	if (hlistview)
+		SendMessageW (hlistview, WM_SETREDRAW, FALSE, 0);
 
 	// set item lparam information
 	for (INT i = 0; i < _r_listview_getitemcount (hwnd, IDC_LISTVIEW); i++)
@@ -914,7 +1066,10 @@ VOID CALLBACK _app_timercallback (
 	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.system_cache.total_bytes);
 	_r_listview_setitem (hwnd, IDC_LISTVIEW, 8, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
 
-	if (_r_wnd_isvisible (hwnd, FALSE))
+	if (hlistview)
+		SendMessageW (hlistview, WM_SETREDRAW, TRUE, 0);
+
+	if (is_visible)
 		_r_listview_redraw (hwnd, IDC_LISTVIEW);
 }
 
@@ -928,6 +1083,14 @@ VOID _app_iconredraw (
 		_app_timercallback (hwnd, 0, UID, 0);
 }
 
+VOID _app_iconstylechanged (
+	_In_opt_ HWND hwnd
+)
+{
+	_app_iconcacheclear ();
+	_app_iconredraw (hwnd);
+}
+
 VOID _app_iconinit (
 	_In_ LONG dpi_value
 )
@@ -935,6 +1098,8 @@ VOID _app_iconinit (
 	LOGFONT logfont;
 	PVOID bits;
 	HDC hdc;
+
+	_app_iconcacheclear ();
 
 	SAFE_DELETE_OBJECT (config.hbitmap_mask);
 	SAFE_DELETE_OBJECT (config.hbitmap);
@@ -1546,7 +1711,7 @@ INT_PTR CALLBACK SettingsProc (
 
 			if (is_stylechanged)
 			{
-				_app_iconredraw (_r_app_gethwnd ());
+				_app_iconstylechanged (_r_app_gethwnd ());
 
 				_r_listview_redraw (_r_app_gethwnd (), IDC_LISTVIEW);
 			}
@@ -1609,7 +1774,7 @@ INT_PTR CALLBACK SettingsProc (
 							_r_config_setlong (L"TrayLevelDanger", value, NULL);
 						}
 
-						_app_iconredraw (_r_app_gethwnd ());
+						_app_iconstylechanged (_r_app_gethwnd ());
 
 						_r_listview_redraw (_r_app_gethwnd (), IDC_LISTVIEW);
 					}
@@ -2030,6 +2195,8 @@ INT_PTR CALLBACK DlgProc (
 
 			_r_tray_destroy (hwnd, &GUID_TrayIcon);
 
+			_app_iconcacheclear ();
+
 			PostQuitMessage (0);
 
 			break;
@@ -2181,7 +2348,7 @@ INT_PTR CALLBACK DlgProc (
 		case WM_HOTKEY:
 		{
 			if (wparam == UID)
-				_app_memorycleanstart (hwnd, SOURCE_HOTKEY, 0);
+				_app_memorycleanstart (hwnd, SOURCE_HOTKEY, 0, 0);
 
 			break;
 		}
@@ -2304,6 +2471,8 @@ INT_PTR CALLBACK DlgProc (
 			{
 				SetCursor (LoadCursorW (NULL, IDC_ARROW));
 
+				_app_memorycleanautotune (cleanup_context, &percent_backoff_until);
+
 				_app_memorycleancomplete (cleanup_context);
 
 				_r_mem_free (cleanup_context);
@@ -2344,7 +2513,7 @@ INT_PTR CALLBACK DlgProc (
 					{
 						case 1:
 						{
-							_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0);
+							_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0, 0);
 							break;
 						}
 
@@ -2773,7 +2942,7 @@ INT_PTR CALLBACK DlgProc (
 						}
 					}
 
-					_app_memorycleanstart (hwnd, SOURCE_CMDLINE, mask);
+					_app_memorycleanstart (hwnd, SOURCE_CMDLINE, 0, mask);
 
 					break;
 				}
@@ -2827,7 +2996,7 @@ INT_PTR CALLBACK DlgProc (
 				{
 					if (_r_sys_iselevated ())
 					{
-						_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0);
+						_app_memorycleanstart (hwnd, SOURCE_MANUAL, 0, 0);
 					}
 					else
 					{
@@ -2898,7 +3067,7 @@ BOOLEAN NTAPI _app_parseargs (
 
 			_app_initialize (NULL);
 
-			_app_memoryclean (NULL, SOURCE_CMDLINE, mask);
+			_app_memoryclean (NULL, SOURCE_CMDLINE, 0, mask);
 
 			return TRUE;
 		}
